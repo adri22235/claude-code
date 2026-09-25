@@ -17,6 +17,7 @@ describe('register', () => {
       name,
       kind,
       size: 0,
+      mtimeMs: 0,
       isLink: false,
     }))
 
