@@ -48,10 +48,13 @@ run() {
     shift 2
     : > "$FAKE_BIN/run.out"
     : > "$FAKE_BIN/run.err"
+    # SG_PYTHON_CACHE points the shim's interpreter cache into $FAKE_BIN so no
+    # test reads or writes the real ~/.claude/security/python-cmd. reset_bin
+    # clears it, so every test starts cold; runs inside one test share it.
     if [ -n "$extra_env" ]; then
-        env "$extra_env" PATH="$path" bash "$SHIM" "$@" > "$FAKE_BIN/run.out" 2> "$FAKE_BIN/run.err"
+        env "$extra_env" SG_PYTHON_CACHE="${SG_TEST_CACHE:-$FAKE_BIN/py-cache}" PATH="$path" bash "$SHIM" "$@" > "$FAKE_BIN/run.out" 2> "$FAKE_BIN/run.err"
     else
-        env PATH="$path" bash "$SHIM" "$@" > "$FAKE_BIN/run.out" 2> "$FAKE_BIN/run.err"
+        env SG_PYTHON_CACHE="${SG_TEST_CACHE:-$FAKE_BIN/py-cache}" PATH="$path" bash "$SHIM" "$@" > "$FAKE_BIN/run.out" 2> "$FAKE_BIN/run.err"
     fi
     RC=$?
     OUT="$(cat "$FAKE_BIN/run.out")"
@@ -160,6 +163,82 @@ run "TMPDIR=$T7_TMP" "$FAKE_BIN:/usr/bin:/bin" -c 'print("ok")'
 after="$(ls "$T7_TMP"/tmp.* 2>/dev/null | wc -l)"
 [ "$before" = "$after" ] && ok "T7: no temp files leaked (before=$before after=$after)" \
                         || bad "T7: temp files leaked (before=$before after=$after)"
+
+###
+# T8 — #98929: the shim must not launch the interpreter twice per hook. The
+# first run probes then execs (2 launches) and records the candidate; later
+# runs reuse it and launch the interpreter exactly once.
+###
+reset_bin
+fake python3 'echo x >> "$(dirname "$0")/launches"' \
+             'if [ "$2" = "import sys; print(sys.version_info[0])" ]; then echo 3; else echo "hook ran"; fi'
+run "" "$FAKE_BIN:/usr/bin:/bin" -c 'print("hook")'
+assert_rc 0 "T8: first run succeeds"
+[ "$(wc -l < "$FAKE_BIN/launches")" -eq 2 ] && ok "T8: cold run launches twice (probe + hook)" \
+                                            || bad "T8: cold run launch count is $(wc -l < "$FAKE_BIN/launches"), want 2"
+[ "$(cat "$FAKE_BIN/py-cache" 2>/dev/null)" = "python3" ] && ok "T8: candidate name cached" || bad "T8: cache not written"
+: > "$FAKE_BIN/launches"
+run "" "$FAKE_BIN:/usr/bin:/bin" -c 'print("hook")'
+assert_rc 0 "T8: cached run succeeds"
+assert_out "hook ran" "T8: cached run executes the hook"
+[ "$(wc -l < "$FAKE_BIN/launches")" -eq 1 ] && ok "T8: warm run launches once" \
+                                            || bad "T8: warm run launch count is $(wc -l < "$FAKE_BIN/launches"), want 1"
+
+###
+# T9 — the multi-word `py -3` candidate is cached and reused with its flag.
+###
+reset_bin
+fake python3 'exit 1'
+fake python  'exit 1'
+fake py      'echo x >> "$(dirname "$0")/launches"' \
+             'if [ "$3" = "import sys; print(sys.version_info[0])" ]; then echo 3; else echo "received:$*"; fi'
+run "" "$FAKE_BIN:/usr/bin:/bin" -c 'print("one")'
+[ "$(cat "$FAKE_BIN/py-cache")" = "py -3" ] && ok "T9: 'py -3' cached as one candidate" || bad "T9: cache holds '$(cat "$FAKE_BIN/py-cache" 2>/dev/null)'"
+: > "$FAKE_BIN/launches"
+run "" "$FAKE_BIN:/usr/bin:/bin" -c 'print("two")'
+assert_out 'received:-3 -c print("two")' "T9: cached py -3 keeps its flag"
+[ "$(wc -l < "$FAKE_BIN/launches")" -eq 1 ] && ok "T9: warm run launches py once" || bad "T9: warm run launch count is $(wc -l < "$FAKE_BIN/launches"), want 1"
+
+###
+# T10 — a cache entry is never trusted blindly: unknown content is ignored and
+# never run, a command that left PATH falls back to probing, and an entry older
+# than a day is re-probed.
+###
+reset_bin
+fake python3 'if [ "$2" = "import sys; print(sys.version_info[0])" ]; then echo 3; else echo "real run"; fi'
+printf '%s\n' 'touch /tmp/sg-cache-injection' > "$FAKE_BIN/py-cache"
+run "" "$FAKE_BIN:/usr/bin:/bin" -c 'print("x")'
+assert_rc 0 "T10: unrecognised cache content is ignored"
+assert_out "real run" "T10: probing still selects the interpreter"
+[ ! -e /tmp/sg-cache-injection ] && ok "T10: cache content never executed" || { bad "T10: cache content was executed"; rm -f /tmp/sg-cache-injection; }
+[ "$(cat "$FAKE_BIN/py-cache")" = "python3" ] && ok "T10: bad entry replaced by a probed candidate" || bad "T10: entry not replaced"
+
+reset_bin
+# `py` is absent from PATH. python3 is stubbed to fail so a real /usr/bin/python3
+# on the host cannot be picked up by the fallback probe.
+fake python3 'exit 1'
+fake python 'if [ "$2" = "import sys; print(sys.version_info[0])" ]; then echo 3; else echo "via python"; fi'
+printf '%s\n' 'py -3' > "$FAKE_BIN/py-cache"
+run "" "$FAKE_BIN:/usr/bin:/bin" -c 'print("x")'
+assert_out "via python" "T10: cached command missing from PATH falls back to probing"
+[ "$(cat "$FAKE_BIN/py-cache")" = "python" ] && ok "T10: stale entry refreshed" || bad "T10: stale entry kept"
+
+reset_bin
+fake python3 'echo x >> "$(dirname "$0")/launches"' \
+             'if [ "$2" = "import sys; print(sys.version_info[0])" ]; then echo 3; else echo "ok"; fi'
+printf '%s\n' 'python3' > "$FAKE_BIN/py-cache"
+touch -d '2 days ago' "$FAKE_BIN/py-cache" 2>/dev/null || touch -t 200001010000 "$FAKE_BIN/py-cache"
+run "" "$FAKE_BIN:/usr/bin:/bin" -c 'print("x")'
+[ "$(wc -l < "$FAKE_BIN/launches")" -eq 2 ] && ok "T10: expired entry is re-probed" || bad "T10: expired entry launch count is $(wc -l < "$FAKE_BIN/launches"), want 2"
+
+###
+# T11 — an unwritable cache location never breaks the hook.
+###
+reset_bin
+fake python3 'if [ "$2" = "import sys; print(sys.version_info[0])" ]; then echo 3; else echo "still ok"; fi'
+SG_TEST_CACHE="/nonexistent-sgtest-dir/sub/python-cmd" run "" "$FAKE_BIN:/usr/bin:/bin" -c 'print("x")'
+assert_rc 0 "T11: hook runs when the cache cannot be written"
+assert_out "still ok" "T11: payload executes without a cache"
 
 echo
 echo "passed: $pass, failed: $fail"

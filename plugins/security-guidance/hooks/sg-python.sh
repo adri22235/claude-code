@@ -22,6 +22,29 @@
 #        "${CLAUDE_PLUGIN_ROOT}/hooks/security_reminder_hook.py"
 set -e
 
+# Fast path: reuse the candidate a previous run already probed. Every probe is
+# an extra interpreter launch, and on Windows the Python Install Manager
+# aliases (py, python, python3 under WindowsApps) start an AppX update per
+# activation that leaks memory in AppXSvc, so probing and then exec'ing doubles
+# that cost on every hook (anthropics/claude-code#98929). Only the candidate
+# *name* is cached, and only if it is one of the fixed names below, so the
+# file's contents are never run as-is. The entry expires after a day, and is
+# ignored when the command is no longer on PATH, so a changed or removed
+# interpreter falls back to probing.
+cache_file="${SG_PYTHON_CACHE:-${HOME:+$HOME/.claude/security/python-cmd}}"
+if [ -n "$cache_file" ] && [ -f "$cache_file" ] \
+        && [ -n "$(find "$cache_file" -mmin -1440 2>/dev/null)" ]; then
+    cached=$(head -n 1 "$cache_file" 2>/dev/null || true)
+    case "$cached" in
+        "python3"|"python"|"py -3")
+            if command -v "${cached%% *}" >/dev/null 2>&1; then
+                # shellcheck disable=SC2086
+                exec $cached "$@"
+            fi
+            ;;
+    esac
+fi
+
 # Capture probe stderr so the all-candidates-failed path can report useful
 # diagnostics. Logging is best-effort: if the temp file cannot be created,
 # fall back to the previous stderr-suppression behavior.
@@ -48,6 +71,14 @@ for cmd in "python3" "python" "py -3"; do
     if [ "$v" = "3" ]; then
         if [ -n "$errlog" ]; then
             rm -f "$errlog"
+        fi
+        # Best-effort: write via a temp name so concurrent hooks never read a
+        # half-written file, and never let a cache failure block the hook.
+        if [ -n "$cache_file" ]; then
+            { mkdir -p "$(dirname "$cache_file")" \
+                && printf '%s\n' "$cmd" > "$cache_file.$$" \
+                && mv -f "$cache_file.$$" "$cache_file"; } 2>/dev/null \
+                || rm -f "$cache_file.$$" 2>/dev/null || true
         fi
         # shellcheck disable=SC2086
         exec $cmd "$@"
