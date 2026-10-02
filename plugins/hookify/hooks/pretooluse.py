@@ -5,22 +5,28 @@ This script is called by Claude Code before any tool executes.
 It reads .claude/hookify.*.local.md files and evaluates rules.
 """
 
+import importlib.machinery
+import importlib.util
+import json
 import os
 import sys
-import json
 
-# CRITICAL: Add plugin root to Python path for imports
-# We need to add the parent of the plugin directory so Python can find "hookify" package
-PLUGIN_ROOT = os.environ.get('CLAUDE_PLUGIN_ROOT')
-if PLUGIN_ROOT:
-    # Add the parent directory of the plugin
-    parent_dir = os.path.dirname(PLUGIN_ROOT)
-    if parent_dir not in sys.path:
-        sys.path.insert(0, parent_dir)
+# CRITICAL: Make the plugin importable as the "hookify" package.
+# The imports below use that name, but the directory the plugin is installed in
+# need not be called "hookify" (the plugin cache names it by version), so a
+# sys.path entry for its parent is not enough. Register the plugin root as the
+# package's search path instead.
+PLUGIN_ROOT = os.environ.get('CLAUDE_PLUGIN_ROOT') or os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))
+)
+if 'hookify' not in sys.modules:
+    _spec = importlib.machinery.ModuleSpec('hookify', None, is_package=True)
+    _spec.submodule_search_locations = [PLUGIN_ROOT]
+    sys.modules['hookify'] = importlib.util.module_from_spec(_spec)
 
-    # Also add PLUGIN_ROOT itself in case we have other scripts
-    if PLUGIN_ROOT not in sys.path:
-        sys.path.insert(0, PLUGIN_ROOT)
+# Also add PLUGIN_ROOT itself in case we have other scripts
+if PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, PLUGIN_ROOT)
 
 try:
     from hookify.core.config_loader import load_rules

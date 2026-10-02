@@ -39,8 +39,15 @@ if [[ -n "$FIELD" ]] && [[ ! "$FIELD" =~ ^[a-zA-Z0-9_-]+$ ]]; then
   exit 1
 fi
 
-# Extract frontmatter
-FRONTMATTER=$(sed -n '/^---$/,/^---$/{ /^---$/d; p; }' "$FILE")
+# Extract frontmatter: the lines between the opening `---` on the first line and
+# the next `---` line. Everything after that is the body, even when it holds
+# more `---` lines (a horizontal rule), which a sed range would reopen.
+FRONTMATTER=$(awk '
+  { sub(/\r$/, "") }
+  NR == 1 { if ($0 != "---") exit; next }
+  $0 == "---" { exit }
+  { print }
+' "$FILE")
 
 if [ -z "$FRONTMATTER" ]; then
   echo "Error: No frontmatter found in $FILE" >&2
