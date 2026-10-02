@@ -194,6 +194,28 @@ describe('register', () => {
   )
 
   test(
+    'a collector record passes over the plugins the person installed',
+    { plugins: [Fixtures.withholding, Fixtures.exporting] },
+    async ($, on) => {
+      on('settings.read', () => ({ value: Fixtures.NO_ALLOWLIST }))
+
+      const reached: unknown[] = []
+      on('telemetry.log', { to: 'collector' }, ($, e) => {
+        reached.push([e.event, e.props?.edited])
+
+        return { value: undefined }
+      })
+
+      await $.command.run(Fixtures.EXPORT_COMMAND)
+
+      expect(reached).toEqual([
+        ['kept', undefined],
+        ['withheld', undefined],
+      ])
+    },
+  )
+
+  test(
     "a user plugin's rewrite of policy is skipped for every other reader",
     {
       plugins: [
