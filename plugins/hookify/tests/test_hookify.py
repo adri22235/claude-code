@@ -225,10 +225,34 @@ class HookScriptTests(unittest.TestCase):
                 self.assertIn('"${CLAUDE_PLUGIN_ROOT}', command, "path must be quoted")
 
         # Run the PreToolUse command through a shell, as the harness does.
-        pre = next(c for c in commands if c.endswith('pretooluse.py"'))
+        pre = next(c for c in commands if "/hooks/pretooluse.py" in c)
         self.assert_rule_fired(
             self.run_hook(pre.replace("python3", shlex.quote(sys.executable), 1), root)
         )
+
+    def test_missing_hook_script_reports_an_error_instead_of_blocking(self):
+        # Exit code 2 from a hook means "block". python3 exits 2 when it cannot
+        # open the script, so a plugin directory that moved under a running
+        # session (an org plugin re-synced to a new path) would block every
+        # prompt and tool call. The commands must exit non-zero but not 2.
+        root = self.install("synced", "org", "hookify~g2")
+        hooks = json.loads((root / "hooks" / "hooks.json").read_text())["hooks"]
+        commands = {event: entries[0]["hooks"][0]["command"] for event, entries in hooks.items()}
+        gone = self.tmp / "synced" / "org" / "hookify~g1"  # the path the session still holds
+        for event, command in commands.items():
+            with self.subTest(event=event):
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    cwd=self.project,
+                    env=dict(os.environ, CLAUDE_PLUGIN_ROOT=str(gone)),
+                    input=json.dumps({"hook_event_name": event}),
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 2, "exit 2 would block")
+                self.assertNotEqual(result.returncode, 0, "the failure must be visible")
+                self.assertIn("hook script not found", result.stderr)
 
 
 if __name__ == "__main__":
