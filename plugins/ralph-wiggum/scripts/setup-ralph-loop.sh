@@ -120,7 +120,19 @@ if [[ "$RAW" == *--max-iterations* ]]; then
       echo "   Invalid: decimals (10.5), negative numbers (-5), text" >&2
       exit 1
     fi
-    MAX_ITERATIONS="$MAX_ITER_VALUE"
+    # Store the value in canonical decimal form. Bash arithmetic (here and in
+    # the stop hook) reads a leading zero as octal: 08 is an error that
+    # silently disabled the cap, and 010 means 8.
+    MAX_ITERATIONS="${MAX_ITER_VALUE#"${MAX_ITER_VALUE%%[!0]*}"}"
+    MAX_ITERATIONS="${MAX_ITERATIONS:-0}"
+    # Bash arithmetic is 64-bit: a longer value would wrap around to a
+    # different, possibly negative (i.e. unlimited), number.
+    if [[ ${#MAX_ITERATIONS} -gt 18 ]]; then
+      echo "❌ Error: --max-iterations is too large: $MAX_ITER_VALUE" >&2
+      echo "" >&2
+      echo "   Use at most 18 digits, or 0 for unlimited." >&2
+      exit 1
+    fi
     RAW="${RAW/"$MAX_ITER_MATCH"/ }"
   else
     echo "❌ Error: --max-iterations requires a number argument" >&2

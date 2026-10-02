@@ -17,15 +17,42 @@ if [[ ! -f "$RALPH_STATE_FILE" ]]; then
   exit 0
 fi
 
-# Parse markdown frontmatter (YAML between ---) and extract values
-FRONTMATTER=$(sed -n '/^---$/,/^---$/{ /^---$/d; p; }' "$RALPH_STATE_FILE")
-ITERATION=$(echo "$FRONTMATTER" | grep '^iteration:' | sed 's/iteration: *//')
-MAX_ITERATIONS=$(echo "$FRONTMATTER" | grep '^max_iterations:' | sed 's/max_iterations: *//')
-# Extract completion_promise and strip surrounding quotes if present
-COMPLETION_PROMISE=$(echo "$FRONTMATTER" | grep '^completion_promise:' | sed 's/completion_promise: *//' | sed 's/^"\(.*\)"$/\1/')
+# Parse the leading markdown frontmatter (YAML between the first two ---
+# lines) and extract values. Only that block counts: the prompt below it may
+# contain --- lines of its own. The `|| true`s keep a missing field from
+# aborting the script under `set -e -o pipefail`, which would leave the state
+# file behind; the validation below stops the loop cleanly instead.
+FRONTMATTER=$(awk '/^---$/{c++; if (c == 2) exit; next} c == 1' "$RALPH_STATE_FILE")
+ITERATION=$(echo "$FRONTMATTER" | grep '^iteration:' | sed 's/^iteration: *//' || true)
+MAX_ITERATIONS=$(echo "$FRONTMATTER" | grep '^max_iterations:' | sed 's/^max_iterations: *//' || true)
+COMPLETION_PROMISE_RAW=$(echo "$FRONTMATTER" | grep '^completion_promise:' | sed 's/^completion_promise: *//' || true)
+
+# setup-ralph-loop.sh writes the promise as a JSON string, so a promise
+# containing " or \ is stored escaped. Decode it; if that fails (e.g. a
+# hand-written state file), just strip the surrounding quotes.
+if [[ "$COMPLETION_PROMISE_RAW" == \"*\" ]]; then
+  COMPLETION_PROMISE=$(printf '%s' "$COMPLETION_PROMISE_RAW" | jq -r '.' 2>/dev/null) \
+    || COMPLETION_PROMISE=$(printf '%s' "$COMPLETION_PROMISE_RAW" | sed 's/^"\(.*\)"$/\1/')
+else
+  COMPLETION_PROMISE="$COMPLETION_PROMISE_RAW"
+fi
+
+# Print a non-negative decimal integer in canonical form, or fail.
+# Leading zeros mean decimal: bash arithmetic would read 08 as an invalid
+# octal number (silently skipping the max_iterations check) and 010 as 8.
+# More than 18 digits could overflow bash's 64-bit arithmetic and turn into a
+# different (even negative, i.e. unlimited) number, so that fails too.
+to_decimal() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  value="${value#"${value%%[!0]*}"}"
+  value="${value:-0}"
+  [[ ${#value} -le 18 ]] || return 1
+  echo "$value"
+}
 
 # Validate numeric fields before arithmetic operations
-if [[ ! "$ITERATION" =~ ^[0-9]+$ ]]; then
+if ! ITERATION_DECIMAL=$(to_decimal "$ITERATION"); then
   echo "⚠️  Ralph loop: State file corrupted" >&2
   echo "   File: $RALPH_STATE_FILE" >&2
   echo "   Problem: 'iteration' field is not a valid number (got: '$ITERATION')" >&2
@@ -35,8 +62,9 @@ if [[ ! "$ITERATION" =~ ^[0-9]+$ ]]; then
   rm "$RALPH_STATE_FILE"
   exit 0
 fi
+ITERATION="$ITERATION_DECIMAL"
 
-if [[ ! "$MAX_ITERATIONS" =~ ^[0-9]+$ ]]; then
+if ! MAX_ITERATIONS_DECIMAL=$(to_decimal "$MAX_ITERATIONS"); then
   echo "⚠️  Ralph loop: State file corrupted" >&2
   echo "   File: $RALPH_STATE_FILE" >&2
   echo "   Problem: 'max_iterations' field is not a valid number (got: '$MAX_ITERATIONS')" >&2
@@ -46,6 +74,7 @@ if [[ ! "$MAX_ITERATIONS" =~ ^[0-9]+$ ]]; then
   rm "$RALPH_STATE_FILE"
   exit 0
 fi
+MAX_ITERATIONS="$MAX_ITERATIONS_DECIMAL"
 
 # Check if max iterations reached
 if [[ $MAX_ITERATIONS -gt 0 ]] && [[ $ITERATION -ge $MAX_ITERATIONS ]]; then
@@ -86,16 +115,15 @@ if [[ -z "$LAST_LINE" ]]; then
   exit 0
 fi
 
-# Parse JSON with error handling
-LAST_OUTPUT=$(echo "$LAST_LINE" | jq -r '
+# Parse JSON with error handling. Test the assignment itself: under `set -e`
+# a failing command substitution aborts the script right here, so a separate
+# `$?` check afterwards never ran and the state file was left behind.
+if ! LAST_OUTPUT=$(echo "$LAST_LINE" | jq -r '
   .message.content |
   map(select(.type == "text")) |
   map(.text) |
   join("\n")
-' 2>&1)
-
-# Check if jq succeeded
-if [[ $? -ne 0 ]]; then
+' 2>&1); then
   echo "⚠️  Ralph loop: Failed to parse assistant message JSON" >&2
   echo "   Error: $LAST_OUTPUT" >&2
   echo "   This may indicate a transcript format issue" >&2
@@ -113,14 +141,21 @@ fi
 
 # Check for completion promise (only if set)
 if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
-  # Extract text from <promise> tags using Perl for multiline support
-  # -0777 slurps entire input, s flag makes . match newlines
-  # .*? is non-greedy (takes FIRST tag), whitespace normalized
-  PROMISE_TEXT=$(echo "$LAST_OUTPUT" | perl -0777 -pe 's/.*?<promise>(.*?)<\/promise>.*/$1/s; s/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || echo "")
+  # Extract the text of the FIRST <promise>...</promise> tag using Perl for
+  # multiline support (-0777 slurps the entire input, the s flag makes .
+  # match newlines, .*? is non-greedy) and normalize its whitespace.
+  # -n prints only when a tag is found: with -p, a message without any tag
+  # was echoed back whole, so a bare message equal to the promise ended the
+  # loop.
+  PROMISE_TEXT=$(printf '%s' "$LAST_OUTPUT" | perl -0777 -ne 'if (/<promise>(.*?)<\/promise>/s) { my $t = $1; $t =~ s/^\s+|\s+$//g; $t =~ s/\s+/ /g; print $t; }' 2>/dev/null || echo "")
 
-  # Use = for literal string comparison (not pattern matching)
-  # == in [[ ]] does glob pattern matching which breaks with *, ?, [ characters
-  if [[ -n "$PROMISE_TEXT" ]] && [[ "$PROMISE_TEXT" = "$COMPLETION_PROMISE" ]]; then
+  # Normalize the expected promise the same way, so a promise with doubled or
+  # surrounding whitespace can still be matched.
+  EXPECTED_PROMISE=$(printf '%s' "$COMPLETION_PROMISE" | perl -0777 -pe 's/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || echo "")
+
+  # Literal string comparison: the right-hand side is quoted, so [[ ]] does
+  # not treat *, ? or [ in the promise as glob pattern characters.
+  if [[ -n "$PROMISE_TEXT" ]] && [[ "$PROMISE_TEXT" = "$EXPECTED_PROMISE" ]]; then
     echo "✅ Ralph loop: Detected <promise>$COMPLETION_PROMISE</promise>"
     rm "$RALPH_STATE_FILE"
     exit 0
@@ -149,10 +184,17 @@ if [[ -z "$PROMPT_TEXT" ]]; then
   exit 0
 fi
 
-# Update iteration in frontmatter (portable across macOS and Linux)
-# Create temp file, then atomically replace
+# Update iteration in the leading frontmatter only, accepting "iteration:N"
+# as well as "iteration: N" like the reader above; otherwise the counter
+# never advances and max_iterations is never reached. Lines in the prompt are
+# left alone. Portable across macOS and Linux: create a temp file, then
+# atomically replace.
 TEMP_FILE="${RALPH_STATE_FILE}.tmp.$$"
-sed "s/^iteration: .*/iteration: $NEXT_ITERATION/" "$RALPH_STATE_FILE" > "$TEMP_FILE"
+awk -v n="$NEXT_ITERATION" '
+  /^---$/ && c < 2 { c++; print; next }
+  c == 1 && /^iteration:/ { print "iteration: " n; next }
+  { print }
+' "$RALPH_STATE_FILE" > "$TEMP_FILE"
 mv "$TEMP_FILE" "$RALPH_STATE_FILE"
 
 # Build system message with iteration count and completion promise info
