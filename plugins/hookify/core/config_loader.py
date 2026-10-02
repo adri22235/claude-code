@@ -84,6 +84,14 @@ class Rule:
         )
 
 
+# Opening `---` line, the frontmatter (may be empty), a closing `---` line, then
+# the message body.
+_FRONTMATTER_RE = re.compile(
+    r'---[ \t]*\r?\n(?:(.*?)\r?\n)?---[ \t]*(?:\r?\n|\Z)(.*)\Z',
+    re.DOTALL,
+)
+
+
 def extract_frontmatter(content: str) -> tuple[Dict[str, Any], str]:
     """Extract YAML frontmatter and message body from markdown.
 
@@ -91,16 +99,15 @@ def extract_frontmatter(content: str) -> tuple[Dict[str, Any], str]:
 
     Supports multi-line dictionary items in lists by preserving indentation.
     """
-    if not content.startswith('---'):
+    # The frontmatter is delimited by lines that hold only `---`. Splitting on
+    # the bare string would cut a value that contains `---` (a regex such as
+    # `a---b`) and move the rest of it into the message.
+    match = _FRONTMATTER_RE.match(content)
+    if not match:
         return {}, content
 
-    # Split on --- markers
-    parts = content.split('---', 2)
-    if len(parts) < 3:
-        return {}, content
-
-    frontmatter_text = parts[1]
-    message = parts[2].strip()
+    frontmatter_text = match.group(1) or ''
+    message = match.group(2).strip()
 
     # Simple YAML parser that handles indented list items
     frontmatter = {}
@@ -248,7 +255,10 @@ def load_rule_file(file_path: str) -> Optional[Rule]:
         Rule object or None if file is invalid.
     """
     try:
-        with open(file_path, 'r') as f:
+        # Rule files are UTF-8. Without an explicit encoding Python uses the
+        # locale's (cp1252 on Windows), so a rule with non-ASCII text is
+        # skipped. utf-8-sig also accepts the BOM some Windows editors add.
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
             content = f.read()
 
         frontmatter, message = extract_frontmatter(content)
