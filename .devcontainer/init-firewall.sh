@@ -89,7 +89,7 @@ while read -r cidr; do
         exit 1
     fi
     echo "Adding GitHub range $cidr"
-    ipset add allowed-domains "$cidr"
+    ipset add -exist allowed-domains "$cidr"
 done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | grep -v ':' | aggregate -q)
 
 if [ "$IPV6_ENABLED" = true ]; then
@@ -100,7 +100,7 @@ if [ "$IPV6_ENABLED" = true ]; then
             exit 1
         fi
         echo "Adding GitHub IPv6 range $cidr"
-        ipset add allowed-domains-v6 "$cidr"
+        ipset add -exist allowed-domains-v6 "$cidr"
     done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | grep ':' | sort -u)
 fi
 
@@ -157,7 +157,7 @@ for domain in "${REQUIRED_DOMAINS[@]}" "${OPTIONAL_DOMAINS[@]}"; do
             continue
         fi
         echo "Adding $ip for $domain"
-        ipset add allowed-domains "$ip"
+        ipset add -exist allowed-domains "$ip"
     done < <(echo "$ips")
 
     # Also add AAAA records so allowed domains work first-class over IPv6.
@@ -176,7 +176,7 @@ for domain in "${REQUIRED_DOMAINS[@]}" "${OPTIONAL_DOMAINS[@]}"; do
                     continue
                 fi
                 echo "Adding $ip for $domain (IPv6)"
-                ipset add allowed-domains-v6 "$ip"
+                ipset add -exist allowed-domains-v6 "$ip"
             fi
         done < <(echo "$ipv6s")
     fi
