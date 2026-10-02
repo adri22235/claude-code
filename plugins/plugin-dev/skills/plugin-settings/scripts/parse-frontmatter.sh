@@ -33,6 +33,12 @@ if [ ! -f "$FILE" ]; then
   exit 1
 fi
 
+# Validate field name to prevent injection
+if [[ -n "$FIELD" ]] && [[ ! "$FIELD" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  echo "Error: Field name must be alphanumeric" >&2
+  exit 1
+fi
+
 # Extract frontmatter: the lines between the opening `---` on the first line and
 # the next `---` line. Everything after that is the body, even when it holds
 # more `---` lines (a horizontal rule), which a sed range would reopen.
